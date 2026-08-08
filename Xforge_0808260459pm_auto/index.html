@@ -315,6 +315,15 @@
     color: var(--dim); opacity: 0.5; font-size: 10.5px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
   }
+  .msg-system {
+    font-size: 11.5px; color: var(--dim); font-style: italic;
+    padding: 4px 10px; border-left: 2px solid var(--border); margin: 6px 0;
+  }
+  .msg-system.err { color: var(--coral); border-left-color: var(--coral); }
+  #compact-btn {
+    font-size: 10.5px; padding: 2px 8px; opacity: 0.75; cursor: pointer;
+  }
+  #compact-btn:hover { opacity: 1; }
   .status-text.warn { color: var(--amber); }
   .status-text.danger { color: var(--coral); }
   .msg-note .text { cursor: pointer; }
@@ -532,6 +541,7 @@
         <button id="aa-refresh-btn" style="display:none" title="Manually refresh live model rankings from ArtificialAnalysis">↻</button>
         <div class="spacer"></div>
         <span class="status-text" id="token-usage" title="How full this model's context window is"></span>
+        <button id="compact-btn" title="Summarise earlier messages now to free up context">compact</button>
         <span class="status-text" id="key-quota" title="Spending cap remaining on your API key"></span>
         <span class="status-text" id="session-label"></span>
       </div>
@@ -604,6 +614,7 @@ const aaRefreshBtn = document.getElementById('aa-refresh-btn');
 const sessionLabel = document.getElementById('session-label');
 const tokenUsageEl = document.getElementById('token-usage');
 const keyQuotaEl = document.getElementById('key-quota');
+const compactBtn = document.getElementById('compact-btn');
 let lastQuota = null; // cached so the reset countdown can keep ticking between requests
 const rootPathEl = document.getElementById('root-path');
 const sessionListEl = document.getElementById('session-list');
@@ -1038,6 +1049,17 @@ function appendErrorMessage(text) {
   scrollToBottom();
 }
 
+// Quiet status line for things the agent did to the conversation itself
+// (compaction), as opposed to an answer or an error.
+function appendSystemNote(text, isError = false) {
+  hideEmptyState();
+  const row = document.createElement('div');
+  row.className = 'msg-row';
+  row.innerHTML = `<div class="msg-system${isError ? ' err' : ''}">⤺ ${escapeHtml(text)}</div>`;
+  contentContainer().appendChild(row);
+  scrollToBottom();
+}
+
 function appendUploadNote(text) {
   hideEmptyState();
   const row = document.createElement('div');
@@ -1117,6 +1139,13 @@ evtSource.onmessage = (e) => {
     case 'done': setTurnStatus('done'); break;
     case 'usage': updateTokenUsage(data.usage, data.contextLimit); break;
     case 'quota': updateKeyQuota(data.quota); break;
+    case 'compacting': hideThinking(); appendSystemNote('Context is filling up — summarising earlier messages…'); break;
+    case 'compacted': {
+      const saved = data.before && data.after ? ` (${formatTokenCount(data.before)} → ${formatTokenCount(data.after)})` : '';
+      appendSystemNote(`Compacted ${data.summarised} earlier messages into a summary${saved}. Full history saved to disk.`);
+      break;
+    }
+    case 'compact_failed': appendSystemNote(`Couldn't compact: ${data.error}`, true); break;
     case 'idle':
       setBusy(false); endToolGroup(); updateTokenUsage(data.usage, data.contextLimit); updateKeyQuota(data.quota);
       if (!currentTurnStatusSet) setTurnStatus('done'); // safety net — done/error/stopped should always precede idle, but don't leave a turn unmarked if something unexpected happens
@@ -1349,6 +1378,19 @@ function updateKeyQuota(quota) {
 // Keep the countdown honest while the window sits open, rather than freezing at
 // whatever it said when the last request finished.
 setInterval(() => { if (lastQuota) updateKeyQuota(lastQuota); }, 60_000);
+
+compactBtn.addEventListener('click', async () => {
+  if (busy) { appendSystemNote('Wait for the current reply to finish before compacting.', true); return; }
+  compactBtn.disabled = true;
+  try {
+    const res = await fetch('/api/compact', { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) appendSystemNote(`Couldn't compact: ${data.error}`, true);
+    else refreshState();
+  } catch (e) {
+    appendSystemNote(`Couldn't compact: ${e.message}`, true);
+  } finally { compactBtn.disabled = false; }
+});
 
 async function refreshState() {
   const res = await fetch('/api/state');

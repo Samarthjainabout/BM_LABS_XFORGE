@@ -614,6 +614,154 @@ const FALLBACK_CONTEXT_LIMITS = {
 };
 function contextLimitFor(m) { return modelContextLimits[m] || FALLBACK_CONTEXT_LIMITS[m] || null; }
 
+// =========================================================================
+// Context compaction
+// Long agent runs die two ways: a hard context-limit error mid-task, or a
+// slow bleed where every round resends the whole transcript. Compaction
+// replaces the older part of the conversation with a written summary and
+// keeps the recent part verbatim.
+// =========================================================================
+const COMPACT_AT = 0.75;      // start compacting once the prompt fills this much of the window
+const COMPACT_KEEP = 0.30;    // keep roughly this share of the window as verbatim recent history
+let compactEnabled = true;
+let lastCompactionAt = 0;     // messages.length when we last compacted — avoids re-compacting the same tail
+
+// No tokenizer here, and a wrong estimate is worse than a rough one, so this is
+// deliberately pessimistic: ~3.5 chars/token overestimates for English prose,
+// which errs toward compacting early rather than blowing the window.
+function estimateTokens(msgs) {
+  let chars = 0;
+  for (const m of msgs) {
+    chars += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
+    if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+  }
+  return Math.ceil(chars / 3.5);
+}
+
+// Best available read on how full the window is: the provider's own prompt_tokens
+// from the last round if we have it, falling back to the estimate.
+function currentPromptTokens() {
+  return lastUsage?.promptTokens || estimateTokens(messages);
+}
+
+// A split is only safe at a real user turn. Cutting anywhere else can orphan a
+// `role:'tool'` message from the assistant message whose tool_calls it answers,
+// which every provider rejects with a 400. For Anthropic, tool results are
+// role:'user' with an array content, so a genuine user turn must also be a string.
+function isSafeSplitPoint(m) {
+  return m && m.role === 'user' && typeof m.content === 'string';
+}
+
+// Walk forward from the desired cut to the next genuine user turn. Returns -1 if
+// there isn't one — better to send an oversized prompt than a malformed one.
+function findSafeSplit(from) {
+  for (let i = from; i < messages.length; i++) if (isSafeSplitPoint(messages[i])) return i;
+  return -1;
+}
+
+function summariseModel() {
+  // Summarising is cheap, mechanical work — never burn the expensive tier on it.
+  if (providerName === 'openrouter') return 'anthropic/claude-haiku-4.5';
+  if (providerName === 'anthropic') return 'claude-haiku-4-5-20251001';
+  return model;
+}
+
+async function summariseMessages(older) {
+  const transcript = older.map(m => {
+    const who = m.role === 'tool' ? 'TOOL RESULT' : m.role.toUpperCase();
+    let body = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    if (m.tool_calls) body += ' [called: ' + m.tool_calls.map(t => t.function?.name).join(', ') + ']';
+    return `${who}: ${body.slice(0, 4000)}`;   // cap any single monster tool result
+  }).join('\n\n').slice(0, 300_000);
+
+  const instruction =
+    `Summarise this agent session transcript so work can continue without the original text. ` +
+    `This is a hardware/firmware debugging context, so preserve precisely: the user's goals and ` +
+    `explicit instructions, decisions made and their reasoning, files and functions modified, ` +
+    `measured values and observations, hardware wiring/pin assignments, what was tried and failed ` +
+    `and why, and any unresolved questions. Discard: command syntax, directory listings, and ` +
+    `superseded intermediate output. Write dense prose under 1500 words. Do not add commentary.`;
+
+  const key = getApiKey(provider);
+  const res = await fetch(provider.kind === 'anthropic-messages' ? provider.baseURL : provider.baseURL, {
+    method: 'POST',
+    headers: provider.kind === 'anthropic-messages'
+      ? { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }
+      : { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}), ...(provider.extraHeaders || {}) },
+    body: JSON.stringify(provider.kind === 'anthropic-messages'
+      ? { model: summariseModel(), max_tokens: 4096, messages: [{ role: 'user', content: `${instruction}\n\n---\n\n${transcript}` }] }
+      : { model: summariseModel(), messages: [{ role: 'user', content: `${instruction}\n\n---\n\n${transcript}` }] })
+  });
+  if (!res.ok) throw new Error(`summariser returned ${res.status}`);
+  const data = await res.json();
+  return provider.kind === 'anthropic-messages'
+    ? data.content.filter(b => b.type === 'text').map(b => b.text).join('\n')
+    : (data.choices?.[0]?.message?.content || '');
+}
+
+// Returns { ok, error?, before?, after?, kept? }
+async function compactContext(reason = 'auto') {
+  const limit = contextLimitFor(lastUsedModel || model);
+  if (!limit) return { ok: false, error: 'context limit for this model is unknown' };
+
+  // Keep the most recent slice verbatim. Budget against the transcript's OWN
+  // size, not the model limit: the trigger uses provider-reported tokens while
+  // this walk uses the estimator, and if the estimator reads low, budgeting
+  // against the limit keeps everything and compacts nothing — failing silently
+  // at exactly the moment it's needed.
+  const estTotal = estimateTokens(messages);
+  const keepBudget = Math.min(Math.floor(limit * COMPACT_KEEP), Math.floor(estTotal * 0.35));
+  let idx = messages.length;
+  let kept = 0;
+  while (idx > 1 && kept < keepBudget) { idx--; kept += estimateTokens([messages[idx]]); }
+  const split = findSafeSplit(Math.max(idx, 1));
+  if (split < 0) return { ok: false, error: 'no safe split point — the recent history is one unbroken tool sequence' };
+
+  const older = messages.slice(1, split);       // index 0 is the system prompt, always kept
+  if (older.length < 4) return { ok: false, error: 'not enough earlier history to be worth compacting' };
+
+  const before = currentPromptTokens();
+  let summary;
+  try { summary = await summariseMessages(older); }
+  catch (err) { return { ok: false, error: `summariser failed: ${err.message}` }; }
+  if (!summary.trim()) return { ok: false, error: 'summariser returned nothing' };
+
+  // Keep the full pre-compaction transcript on disk. Compaction is lossy by
+  // design, and the raw history should never be destroyed to save tokens.
+  try {
+    fs.mkdirSync(sessionsDir(), { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.writeFileSync(path.join(sessionsDir(), `${sessionName}.precompact-${stamp}.json`),
+      JSON.stringify(messages.slice(1), null, 2), 'utf-8');
+  } catch { /* a failed backup shouldn't block compaction, but don't hide it either */ }
+
+  messages = [
+    messages[0],
+    { role: 'user', content:
+      `[Earlier conversation, compacted to save context. ${older.length} messages summarised:]\n\n${summary}` },
+    { role: 'assistant', content: 'Understood — I have the earlier context and will continue from here.' },
+    ...messages.slice(split)
+  ];
+  lastCompactionAt = messages.length;
+  saveSessionMsgs(sessionName, messages);
+
+  const after = estimateTokens(messages);
+  broadcast({ type: 'compacted', reason, before, after, summarised: older.length, model: summariseModel() });
+  return { ok: true, before, after, kept: messages.length - 3 };
+}
+
+// Called before each provider round.
+async function maybeCompact() {
+  if (!compactEnabled) return;
+  const limit = contextLimitFor(lastUsedModel || model);
+  if (!limit) return;
+  if (currentPromptTokens() < limit * COMPACT_AT) return;
+  if (messages.length <= lastCompactionAt + 2) return;  // nothing new since the last attempt
+  broadcast({ type: 'compacting' });
+  const r = await compactContext('auto');
+  if (!r.ok) broadcast({ type: 'compact_failed', error: r.error });
+}
+
 // -------------------------------------------------------------------------
 // Account quota (money) — completely separate from context window (tokens).
 // The two get confused constantly: a conversation can be nowhere near filling
@@ -942,6 +1090,7 @@ async function runAgentLoop(turnStartIndex) {
   try {
     for (let round = 0; round < maxRounds; round++) {
       if (stopRequested) { broadcast({ type: 'stopped' }); return; }
+      await maybeCompact(); // check before building the request, not after it fails
       const effModel = autoActive ? chooseAutoModel({ promptText, round, recentFailures, profileName: autoProfileName }) : model;
       lastUsedModel = effModel;
       broadcast({ type: 'thinking', model: autoActive ? effModel : undefined });
@@ -950,7 +1099,26 @@ async function runAgentLoop(turnStartIndex) {
       try { result = await callProvider(effModel, currentAbortController.signal); }
       catch (err) {
         if (err.name === 'AbortError') { broadcast({ type: 'stopped' }); return; }
-        broadcast({ type: 'error', message: err.message }); return;
+        // A context-overflow error is recoverable: compact and retry once, rather
+        // than losing the turn and making the user resend it by hand.
+        if (compactEnabled && /context length|too many tokens|maximum context|context_length_exceeded|prompt is too long/i.test(err.message)) {
+          broadcast({ type: 'compacting' });
+          const r = await compactContext('overflow');
+          if (r.ok) {
+            try {
+              currentAbortController = new AbortController();
+              result = await callProvider(effModel, currentAbortController.signal);
+            } catch (retryErr) {
+              broadcast({ type: 'error', message: `Context overflowed and compacting didn't free enough room: ${retryErr.message}` });
+              return;
+            }
+          } else {
+            broadcast({ type: 'error', message: `${err.message}\n\nCouldn't compact automatically: ${r.error}` });
+            return;
+          }
+        } else {
+          broadcast({ type: 'error', message: err.message }); return;
+        }
       } finally { currentAbortController = null; }
       broadcast({ type: 'usage', usage: lastUsage, contextLimit: contextLimitFor(effModel), model: autoActive ? effModel : undefined });
       fetchKeyQuota().then(q => { if (q) broadcast({ type: 'quota', quota: q }); });
@@ -1109,7 +1277,7 @@ const server = http.createServer(async (req, res) => {
       sessions: listSessions(), history: historyForClient(),
       providers: Object.entries(PROVIDERS).map(([name, p]) => ({ name, label: p.label, defaultModel: p.defaultModel })),
       bookmarks: loadBookmarks(),
-      usage: lastUsage, contextLimit: contextLimitFor(lastUsedModel || model), lastUsedModel, quota: keyQuota
+      usage: lastUsage, contextLimit: contextLimitFor(lastUsedModel || model), lastUsedModel, quota: keyQuota, compactEnabled
     });
   }
 
@@ -1202,6 +1370,18 @@ const server = http.createServer(async (req, res) => {
     messages = [{ role: 'system', content: buildSystemPrompt() }];
     saveSessionMsgs(sessionName, messages);
     return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/api/compact' && req.method === 'POST') {
+    if (busy) return send(res, 409, { ok: false, error: 'Wait for the current reply to finish before compacting.' });
+    broadcast({ type: 'compacting' });
+    const r = await compactContext('manual');
+    if (!r.ok) { broadcast({ type: 'compact_failed', error: r.error }); return send(res, 400, r); }
+    return send(res, 200, { ...r, history: historyForClient() });
+  }
+  if (url.pathname === '/api/compact/toggle' && req.method === 'POST') {
+    const { enabled } = await readBody(req);
+    compactEnabled = !!enabled;
+    return send(res, 200, { ok: true, compactEnabled });
   }
   if (url.pathname === '/api/session/branch' && req.method === 'POST') {
     if (busy) return send(res, 409, { ok: false, error: 'Wait for the current reply to finish before branching.' });
