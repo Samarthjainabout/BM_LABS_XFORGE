@@ -151,7 +151,7 @@ async function runCoreTool(name, args) {
 // =========================================================================
 // Hardware tools (Arduino / serial / logic analyzer)
 // =========================================================================
-const SCRIPTS_DIR = path.join(ROOT, 'scripts');
+function scriptsDir() { return path.join(ROOT, 'scripts'); } // function, not a frozen const — ROOT can change (restored state, /cd, bookmarks) after module load
 const LIST_PORTS_PY = `#!/usr/bin/env python3
 import json, sys
 try:
@@ -184,8 +184,8 @@ except Exception as e:
     print(json.dumps({"ok": False, "error": str(e)})); sys.exit(1)
 `;
 function ensureHelperScripts() {
-  fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
-  const p1 = path.join(SCRIPTS_DIR, 'list_ports.py'), p2 = path.join(SCRIPTS_DIR, 'serial_monitor.py');
+  fs.mkdirSync(scriptsDir(), { recursive: true });
+  const p1 = path.join(scriptsDir(), 'list_ports.py'), p2 = path.join(scriptsDir(), 'serial_monitor.py');
   if (!fs.existsSync(p1)) fs.writeFileSync(p1, LIST_PORTS_PY, 'utf-8');
   if (!fs.existsSync(p2)) fs.writeFileSync(p2, SERIAL_MONITOR_PY, 'utf-8');
 }
@@ -230,13 +230,13 @@ async function runHardwareTool(name, args) {
     }
     case 'list_serial_ports': {
       ensureHelperScripts();
-      const r = await runShell(`python3 ${shq(path.join(SCRIPTS_DIR, 'list_ports.py'))}`);
+      const r = await runShell(`python3 ${shq(path.join(scriptsDir(), 'list_ports.py'))}`);
       return r.ok ? safeJson(r.stdout) : { ok: false, error: r.error, stderr: r.stderr };
     }
     case 'serial_monitor': {
       ensureHelperScripts();
       const baud = args.baud || 9600, duration = args.duration_s || 5, maxLines = args.max_lines || 0;
-      const r = await runShell(`python3 ${shq(path.join(SCRIPTS_DIR, 'serial_monitor.py'))} --port ${shq(args.port)} --baud ${baud} --duration ${duration} --max-lines ${maxLines}`, { timeout_ms: (duration + 10) * 1000 });
+      const r = await runShell(`python3 ${shq(path.join(scriptsDir(), 'serial_monitor.py'))} --port ${shq(args.port)} --baud ${baud} --duration ${duration} --max-lines ${maxLines}`, { timeout_ms: (duration + 10) * 1000 });
       if (!r.ok) return { ok: false, error: r.error, stderr: r.stderr };
       const parsed = safeJson(r.stdout);
       if (parsed.ok && args.save_to) {
@@ -280,13 +280,20 @@ function sessionFile(name) { return path.join(sessionsDir(), `${name}.json`); }
 function loadSessionMsgs(name) {
   const f = sessionFile(name);
   if (!fs.existsSync(f)) return [];
-  try { const d = JSON.parse(fs.readFileSync(f, 'utf-8')); return Array.isArray(d) ? d : []; } catch { return []; }
+  try {
+    const d = JSON.parse(fs.readFileSync(f, 'utf-8'));
+    if (!Array.isArray(d)) return [];
+    // clean up any thinking blocks saved before this fix existed — old poisoned
+    // sessions would otherwise keep hitting the same signature error forever,
+    // even after upgrading, since the bad content is sitting in the file itself
+    return d.map(m => (m && m.role === 'assistant') ? stripThinkingBlocks(m) : m);
+  } catch { return []; }
 }
 function saveSessionMsgs(name, msgs) {
   fs.mkdirSync(sessionsDir(), { recursive: true });
   fs.writeFileSync(sessionFile(name), JSON.stringify(msgs.slice(1), null, 2), 'utf-8');
 }
-function listSessions() {
+function listSessions(includeArchived = false) {
   const dir = sessionsDir();
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.endsWith('.meta.json')).map(f => {
@@ -296,8 +303,10 @@ function listSessions() {
     try { turns = JSON.parse(fs.readFileSync(full, 'utf-8')).length; } catch { /* ignore */ }
     const name = f.replace(/\.json$/, '');
     const meta = getSessionMeta(name);
-    return { name, updated: stat.mtime.toISOString(), turns, branchedFrom: meta?.branchedFrom || null };
-  }).sort((a, b) => new Date(b.updated) - new Date(a.updated));
+    return { name, updated: stat.mtime.toISOString(), turns, branchedFrom: meta?.branchedFrom || null, archived: !!meta?.archived };
+  })
+    .filter(s => includeArchived || !s.archived)
+    .sort((a, b) => new Date(b.updated) - new Date(a.updated));
 }
 function deleteSessionFile(name) {
   const f = sessionFile(name);
@@ -395,6 +404,22 @@ function getSessionMeta(name) {
   if (!fs.existsSync(f)) return null;
   try { return JSON.parse(fs.readFileSync(f, 'utf-8')); } catch { return null; }
 }
+function setSessionMeta(name, patch) {
+  const f = path.join(sessionsDir(), `${name}.meta.json`);
+  const existing = getSessionMeta(name) || {};
+  fs.mkdirSync(sessionsDir(), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ ...existing, ...patch }, null, 2), 'utf-8');
+}
+function archiveSession(name) {
+  if (!fs.existsSync(sessionFile(name))) return { ok: false, error: `"${name}" doesn't exist` };
+  setSessionMeta(name, { archived: true, archivedAt: new Date().toISOString() });
+  return { ok: true };
+}
+function unarchiveSession(name) {
+  if (!fs.existsSync(sessionFile(name))) return { ok: false, error: `"${name}" doesn't exist` };
+  setSessionMeta(name, { archived: false, archivedAt: null });
+  return { ok: true };
+}
 
 async function gitClone(url, dest) {
   const target = dest ? resolveSafe(dest) : resolveSafe(path.basename(url.replace(/\.git$/, '')));
@@ -412,6 +437,55 @@ function listGitProjects() {
 // isn't scoped to whatever ROOT happens to be right now.
 // =========================================================================
 const BOOKMARKS_FILE = path.join(__dirname, 'projects.json');
+const LAST_STATE_FILE = path.join(__dirname, 'last-state.json');
+
+// Remembers which project folder + chat was active, so relaunching
+// start.command picks up exactly where you left off instead of always
+// resetting to the app's own install folder. Saved on every /cd and every
+// session switch; restored once at startup, before the server starts
+// listening. Silently does nothing if the saved folder no longer exists —
+// falls back to the normal launch-folder behavior in that case.
+function saveLastState() {
+  try { fs.writeFileSync(LAST_STATE_FILE, JSON.stringify({ root: ROOT, sessionName }, null, 2), 'utf-8'); }
+  catch { /* best effort — not worth failing a request over */ }
+}
+function restoreLastState() {
+  if (!fs.existsSync(LAST_STATE_FILE)) return;
+  try {
+    const saved = JSON.parse(fs.readFileSync(LAST_STATE_FILE, 'utf-8'));
+    if (saved.root && fs.existsSync(saved.root) && fs.statSync(saved.root).isDirectory()) {
+      ROOT = saved.root;
+      process.chdir(ROOT);
+      switchSession(loadPerProjectLastSession());
+    }
+  } catch { /* corrupt or unreadable — just start fresh in the launch folder */ }
+}
+
+// Separate from the app-wide "which project was I in" tracking above, this
+// remembers which specific chat (including branches) was last active
+// *within* a given project — stored inside that project's own
+// .codex-agent folder, so the memory travels with the project itself
+// (e.g. survives a copy/move of the folder) rather than living only in the
+// app's install directory. Without this, navigating back into a project
+// you'd branched a few chats deep in would always dump you back on
+// "default" instead of the branch you were actually working on.
+function perProjectLastSessionFile() { return path.join(ROOT, '.codex-agent', 'last-session.txt'); }
+function savePerProjectLastSession() {
+  try {
+    fs.mkdirSync(path.join(ROOT, '.codex-agent'), { recursive: true });
+    fs.writeFileSync(perProjectLastSessionFile(), sessionName, 'utf-8');
+  } catch { /* best effort */ }
+}
+function loadPerProjectLastSession() {
+  try {
+    const f = perProjectLastSessionFile();
+    if (fs.existsSync(f)) {
+      const name = fs.readFileSync(f, 'utf-8').trim();
+      if (name && fs.existsSync(sessionFile(name))) return name; // only honor it if that chat still actually exists (wasn't deleted since)
+    }
+  } catch { /* ignore */ }
+  return 'default';
+}
 
 function expandHome(p) {
   if (p === '~') return os.homedir();
@@ -462,7 +536,15 @@ Rules:
 - Explain briefly what you're about to do before calling a destructive tool.
 - Never invent output — only report what tools actually returned.
 - If a task is ambiguous, ask a short clarifying question instead of guessing.
-- This is a git-aware environment: use run_command for any git operation and for installing dependencies / running builds and tests.`;
+- This is a git-aware environment: use run_command for any git operation and for installing dependencies / running builds and tests.
+
+Narration (how you report progress to the user):
+- Before each tool call or group of related tool calls, emit one short plain-English line saying WHAT you're doing and WHY, in that order. Aim for under 20 words; one sentence, no bullet points.
+- Write it for someone watching who has not read the command. Say the intent, not the syntax: "Checking which serial port the measurement Teensy is on" — not "Running ps aux | grep -E sync_con over ssh".
+- Do not paste commands, file paths, IP addresses, flags, or code into the narration line. The command itself is already shown next to it.
+- When a tool call fails, the next narration line must say what failed in plain terms and what you're trying instead: "That path didn't exist, so I'm searching the repo for the sketch by name."
+- When you repeat a similar step several times, say what's different about this one ("same check, now on the second board") rather than repeating the same line.
+- At the end of a turn, before the final answer, state in one or two sentences what changed on disk or on hardware as a result — or say explicitly that nothing was changed.`;
 }
 
 let sessionName = 'default';
@@ -498,6 +580,28 @@ function toolDefsForRequest() {
 // =========================================================================
 function safeParse(s) { try { return JSON.parse(s); } catch { return {}; } }
 
+// Strips 'thinking'/'redacted_thinking' content blocks (and any reasoning
+// passthrough fields) from an assistant message before it's stored in
+// history. These carry a cryptographic signature tied to the exact model
+// and backend route that produced them — replaying one back in a later
+// request is fine if the same model/route handles it again, but breaks
+// with "Invalid signature in thinking block" the moment a different model
+// or backend answers instead. That's routine with Auto mode, which
+// deliberately switches models mid-conversation, so this always runs
+// regardless of mode. Only the actual text/tool_calls matter for context —
+// the model doesn't need to see its own past internal reasoning verbatim
+// to keep going.
+function stripThinkingBlocks(rawMessage) {
+  if (!rawMessage || typeof rawMessage !== 'object') return rawMessage;
+  const clean = { ...rawMessage };
+  if (Array.isArray(clean.content)) {
+    clean.content = clean.content.filter(b => b && b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  }
+  delete clean.reasoning_details;
+  delete clean.reasoning;
+  return clean;
+}
+
 let lastUsage = null; // { promptTokens, completionTokens, totalTokens } from the most recent provider response
 const modelContextLimits = {}; // populated as /api/models is fetched — model id -> context_length
 const modelPricing = {}; // populated as /api/models is fetched — model id -> { promptPerM, completionPerM } USD per 1M tokens
@@ -510,17 +614,94 @@ const FALLBACK_CONTEXT_LIMITS = {
 };
 function contextLimitFor(m) { return modelContextLimits[m] || FALLBACK_CONTEXT_LIMITS[m] || null; }
 
+// -------------------------------------------------------------------------
+// Account quota (money) — completely separate from context window (tokens).
+// The two get confused constantly: a conversation can be nowhere near filling
+// the model's context while the key is already out of credit, which is exactly
+// what a 403 "key limit exceeded" is telling you.
+// -------------------------------------------------------------------------
+let keyQuota = null;      // { limit, remaining, usage, reset, label } in USD, or null if unknown
+let keyQuotaFetchedAt = 0;
+
+async function fetchKeyQuota() {
+  if (providerName !== 'openrouter') { keyQuota = null; return null; }
+  if (Date.now() - keyQuotaFetchedAt < 30_000) return keyQuota; // cache — this is a billing endpoint, don't hammer it
+  keyQuotaFetchedAt = Date.now();
+  const key = getApiKey(provider);
+  if (!key) { keyQuota = null; return null; }
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/key', { headers: { Authorization: `Bearer ${key}` } });
+    if (!res.ok) { keyQuota = null; return null; }
+    const { data } = await res.json();
+    keyQuota = {
+      limit: data?.limit ?? null,                  // null means the key has no cap
+      remaining: data?.limit_remaining ?? null,
+      usage: data?.usage ?? null,                  // dollars spent on this key
+      reset: data?.limit_reset ?? null,            // 'daily' | 'weekly' | 'monthly' | null
+      label: data?.label || ''
+    };
+    return keyQuota;
+  } catch { keyQuota = null; return null; }
+}
+
 // Translates known upstream error shapes into something actionable instead of raw JSON.
+// Same window math as the UI: OpenRouter resets at midnight UTC, weeks Mon–Sun.
+function nextResetDate(resetType) {
+  if (!resetType) return null;
+  const now = new Date();
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  switch (String(resetType).toLowerCase()) {
+    case 'daily': d.setUTCDate(d.getUTCDate() + 1); return d;
+    case 'weekly': {
+      const dow = d.getUTCDay();
+      const daysUntilMonday = (8 - (dow === 0 ? 7 : dow)) % 7 || 7;
+      d.setUTCDate(d.getUTCDate() + daysUntilMonday);
+      return d;
+    }
+    case 'monthly': return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    default: return null;
+  }
+}
+
+// Only says something if we actually know the window — never guesses a date.
+function resetSentence() {
+  const reset = keyQuota && nextResetDate(keyQuota.reset);
+  if (!reset) return '';
+  const local = reset.toLocaleString(undefined, { weekday: 'long', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+  const hours = Math.max(0, Math.round((reset - Date.now()) / 3_600_000));
+  return ` This ${keyQuota.reset} limit resets ${local} — about ${hours} hour${hours === 1 ? '' : 's'} from now.`;
+}
+
 function friendlyProviderError(label, status, rawText) {
   let parsed = null;
   try { parsed = JSON.parse(rawText); } catch { /* not JSON, fall through */ }
   const msg = parsed?.error?.message || '';
+  if (status === 403 && /key limit|credit limit|limit exceeded/i.test(msg)) {
+    return `${label} rejected this request — your API key hit its spending limit, not a context limit. ` +
+      `The token counter in the top bar tracks how much of the model's context window this conversation ` +
+      `fills; it has nothing to do with your account balance, which is why it can show plenty "left" while ` +
+      `this fails.${resetSentence()} Raise or reset the key's cap in your OpenRouter key settings, or add credits, ` +
+      `if you don't want to wait.`;
+  }
+  if (status === 402) {
+    return `${label} rejected this request — the account is out of credits. This is a billing limit, not a ` +
+      `context limit, so the token counter in the top bar is unrelated. Add credits to continue.`;
+  }
   if (status === 403 && /content filter/i.test(msg)) {
     return `${label} blocked this request — its content filter flagged something in the conversation ` +
       `(often a tool result: a file's contents or a command's output) and safely redacting it would have ` +
       `broken the tool-call structure, so the whole request was rejected. Try: sending the message again ` +
       `(filters are sometimes inconsistent), switching to a different model, or narrowing whatever command/file ` +
       `produced the last tool result if it returned a lot of output.`;
+  }
+  if (status === 400 && /invalid `?signature`? in `?thinking`? block/i.test(rawText)) {
+    const providerName = parsed?.error?.metadata?.provider_name;
+    return `${label} rejected this request — a Claude "extended thinking" block's signature got corrupted in transit` +
+      (providerName ? ` (routed via ${providerName})` : '') + `. This is a known relay bug on OpenRouter's side when ` +
+      `Claude is served through AWS Bedrock, not something wrong with your conversation. Try: sending the message ` +
+      `again (often route-dependent — a retry can land on a different backend), switching to a non-reasoning Claude ` +
+      `model or a different vendor for this message, or switching provider to Anthropic directly if you have an ` +
+      `ANTHROPIC_API_KEY set, which bypasses this relay entirely.`;
   }
   return `${label} API error ${status}: ${rawText.slice(0, 500)}`;
 }
@@ -749,6 +930,7 @@ async function callProvider(effModel, signal) {
 let busy = false;
 let currentAbortController = null;
 let stopRequested = false;
+let lastUsedModel = null; // the model actually used for the most recent provider call — matters in Auto mode, where it can differ from the manually-selected `model`
 
 async function runAgentLoop(turnStartIndex) {
   busy = true;
@@ -761,6 +943,7 @@ async function runAgentLoop(turnStartIndex) {
     for (let round = 0; round < maxRounds; round++) {
       if (stopRequested) { broadcast({ type: 'stopped' }); return; }
       const effModel = autoActive ? chooseAutoModel({ promptText, round, recentFailures, profileName: autoProfileName }) : model;
+      lastUsedModel = effModel;
       broadcast({ type: 'thinking', model: autoActive ? effModel : undefined });
       currentAbortController = new AbortController();
       let result;
@@ -770,10 +953,11 @@ async function runAgentLoop(turnStartIndex) {
         broadcast({ type: 'error', message: err.message }); return;
       } finally { currentAbortController = null; }
       broadcast({ type: 'usage', usage: lastUsage, contextLimit: contextLimitFor(effModel), model: autoActive ? effModel : undefined });
+      fetchKeyQuota().then(q => { if (q) broadcast({ type: 'quota', quota: q }); });
 
       const isFinal = result.toolCalls.length === 0;
       if (result.assistantText) broadcast({ type: 'assistant_message', text: result.assistantText, final: isFinal, turnStart: turnStartIndex });
-      messages.push(provider.kind === 'openai-chat' ? result.rawMessage : { role: 'assistant', content: result.rawMessage.content });
+      messages.push(provider.kind === 'openai-chat' ? stripThinkingBlocks(result.rawMessage) : stripThinkingBlocks({ role: 'assistant', content: result.rawMessage.content }));
 
       if (isFinal) {
         if (result.assistantText) broadcast({ type: 'checkpoint', index: messages.length });
@@ -807,7 +991,7 @@ async function runAgentLoop(turnStartIndex) {
     busy = false;
     stopRequested = false;
     currentAbortController = null;
-    broadcast({ type: 'idle', usage: lastUsage, contextLimit: contextLimitFor(model) });
+    broadcast({ type: 'idle', usage: lastUsage, contextLimit: contextLimitFor(lastUsedModel || model), quota: keyQuota });
   }
 }
 
@@ -822,6 +1006,8 @@ function switchSession(name) {
   sessionName = name;
   messages = [{ role: 'system', content: buildSystemPrompt() }, ...loadSessionMsgs(name)];
   lastUsage = null; // stale for a different conversation — next reply will repopulate it
+  saveLastState();
+  savePerProjectLastSession();
 }
 
 // True if this raw message included a tool call (OpenAI's tool_calls array,
@@ -863,11 +1049,22 @@ function send(res, status, body, headers = {}) {
   res.writeHead(status, { 'Content-Type': typeof body === 'string' ? 'text/html' : 'application/json', ...headers });
   res.end(data);
 }
+const MAX_BODY_BYTES = 60 * 1024 * 1024; // ~60MB raw (base64 upload payloads are ~33% larger than the source file, so this allows roughly ~45MB files)
 function readBody(req) {
   return new Promise((resolve) => {
     let chunks = '';
-    req.on('data', c => chunks += c);
-    req.on('end', () => { try { resolve(JSON.parse(chunks || '{}')); } catch { resolve({}); } });
+    let bytes = 0;
+    let tooLarge = false;
+    req.on('data', c => {
+      bytes += c.length;
+      if (bytes > MAX_BODY_BYTES) { tooLarge = true; req.destroy(); return; }
+      chunks += c;
+    });
+    req.on('end', () => {
+      if (tooLarge) { resolve({ __tooLarge: true }); return; }
+      try { resolve(JSON.parse(chunks || '{}')); } catch { resolve({}); }
+    });
+    req.on('error', () => resolve({}));
   });
 }
 
@@ -912,7 +1109,7 @@ const server = http.createServer(async (req, res) => {
       sessions: listSessions(), history: historyForClient(),
       providers: Object.entries(PROVIDERS).map(([name, p]) => ({ name, label: p.label, defaultModel: p.defaultModel })),
       bookmarks: loadBookmarks(),
-      usage: lastUsage, contextLimit: contextLimitFor(model)
+      usage: lastUsage, contextLimit: contextLimitFor(lastUsedModel || model), lastUsedModel, quota: keyQuota
     });
   }
 
@@ -982,6 +1179,24 @@ const server = http.createServer(async (req, res) => {
     deleteSessionFile(name);
     if (name === sessionName) switchSession('default');
     return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/api/session/archive' && req.method === 'POST') {
+    const { name } = await readBody(req);
+    if (!name) return send(res, 400, { ok: false, error: 'name required' });
+    const result = archiveSession(name);
+    if (!result.ok) return send(res, 400, result);
+    if (name === sessionName) switchSession('default'); // don't leave the active chat pointed at something now hidden
+    return send(res, 200, { ok: true });
+  }
+  if (url.pathname === '/api/session/unarchive' && req.method === 'POST') {
+    const { name } = await readBody(req);
+    if (!name) return send(res, 400, { ok: false, error: 'name required' });
+    const result = unarchiveSession(name);
+    return send(res, result.ok ? 200 : 400, result);
+  }
+  if (url.pathname === '/api/sessions/archived' && req.method === 'GET') {
+    const all = listSessions(true);
+    return send(res, 200, { ok: true, sessions: all.filter(s => s.archived) });
   }
   if (url.pathname === '/api/session/clear' && req.method === 'POST') {
     messages = [{ role: 'system', content: buildSystemPrompt() }];
@@ -1054,7 +1269,7 @@ const server = http.createServer(async (req, res) => {
     if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return send(res, 400, { ok: false, error: 'Not a directory' });
     ROOT = resolved;
     process.chdir(ROOT);
-    switchSession('default');
+    switchSession(loadPerProjectLastSession()); // resume wherever you left off in *this* project, not always "default"
     return send(res, 200, { ok: true, root: ROOT, sessionName, history: historyForClient() });
   }
   if (url.pathname === '/api/projects' && req.method === 'GET') {
@@ -1100,6 +1315,27 @@ const server = http.createServer(async (req, res) => {
     }
     const parent = path.dirname(target);
     return send(res, 200, { ok: true, path: target, parent: parent === target ? null : parent, entries, isGit: fs.existsSync(path.join(target, '.git')) });
+  }
+
+  if (url.pathname === '/api/upload' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (body.__tooLarge) return send(res, 413, { ok: false, error: 'File too large — 45MB limit per upload.' });
+    const { filename, contentBase64, subdir } = body;
+    if (!filename || typeof contentBase64 !== 'string') return send(res, 400, { ok: false, error: 'filename and contentBase64 required' });
+    // basename-only — never let a filename traverse outside the target directory, upload dir stays under ROOT regardless of what the client sends
+    const safeName = path.basename(filename).replace(/[\x00-\x1f]/g, '').trim();
+    if (!safeName) return send(res, 400, { ok: false, error: 'Invalid filename' });
+    const targetDir = subdir ? path.resolve(ROOT, subdir) : ROOT;
+    if (!targetDir.startsWith(path.resolve(ROOT))) return send(res, 400, { ok: false, error: 'Invalid subdir' });
+    try {
+      await fsp.mkdir(targetDir, { recursive: true });
+      const destPath = path.join(targetDir, safeName);
+      const buf = Buffer.from(contentBase64, 'base64');
+      await fsp.writeFile(destPath, buf);
+      return send(res, 200, { ok: true, path: destPath, relativePath: path.relative(ROOT, destPath), bytes: buf.length });
+    } catch (err) {
+      return send(res, 500, { ok: false, error: err.message });
+    }
   }
 
   if (url.pathname === '/api/models' && req.method === 'GET') {
@@ -1160,6 +1396,7 @@ function findOpenPort(start, cb) {
   tryPort(start);
 }
 
+restoreLastState(); // pick up wherever the last session left off, if that project folder still exists
 ensureHelperScripts();
 refreshAutoModeData(); // fire-and-forget — populates AA rankings + OpenRouter model ids if AA_API_KEY is set; auto mode falls back to static lists until this completes
 setInterval(refreshAutoModeData, AA_REFRESH_INTERVAL_MS);
